@@ -1,0 +1,77 @@
+# ============================
+# Temporal RT Model (stan_glmer)
+# ============================
+
+# 📦 Load necessary libraries for modeling, visualization, and diagnostics
+library(rstanarm)
+library(tidyverse)
+library(bayesplot)
+library(parallel)
+library(bayestestR)
+library(posterior)
+
+# 📁 Set working directory and import trial-level RT data
+setwd("E:/TemporalSwitch/DataAnalysis/RT")
+data <- read_csv("bis_rt_trials.csv")
+
+# 🧼 Preprocess dataset: factor conversion, scaling, and filtering
+data <- data %>%
+  mutate(
+    subj_idx = factor(subj_idx),                 
+    hist = factor(hist),                         
+    rt = as.numeric(rt),                         
+    duration = as.numeric(duration*10 - mean(duration*10)),  
+    rsi = as.numeric(rsi*10 - mean(rsi*10)),     
+    block = as.numeric(block - mean(block))                     
+  ) %>%
+  drop_na(rt, duration, hist, block, rsi, subj_idx)  # Remove rows with missing data
+
+# 🔧 Set reference level for contrast coding in 'hist'
+data$hist <- relevel(data$hist, ref = "R")  # 'Repeat' is the reference level
+
+# 📊 Aggregate: compute average RT per subject × condition
+data_avg <- data %>%
+  group_by(subj_idx, hist, duration, rsi, block) %>%
+  summarise(
+    rt = mean(rt, na.rm = TRUE)*1000,
+    .groups = "drop"
+  )
+
+# 💾 Save aggregated dataset
+write_csv(data_avg, "bis_rt_data_avg.csv")
+message("✅ Aggregated data saved as 'bis_rt_data_avg.csv'")
+
+# 📁 Create output folder for saving plots and diagnostics
+output_dir <- "bis_rt_plots"
+if (!dir.exists(output_dir)) dir.create(output_dir)
+
+# 📊 Define weakly informative priors for intercept and slope terms
+prior_intercept <- normal(location = 0, scale = 1, autoscale = TRUE)
+prior_slopes <- normal(location = 0, scale = 1, autoscale = TRUE)
+
+# 🎲 Set seed for reproducibility
+current_seed <- 12345
+
+# 📈 Fit GLMM with log link, polynomial and interaction terms
+fit_rt_model <- stan_glmer(
+  rt ~ hist + duration + I(duration^2) + rsi + block +
+    hist:duration + hist:I(duration^2) + hist:rsi + hist:block +
+    (1 + hist | subj_idx),  # Random intercepts and slopes for 'hist' by subject
+  data = data_avg,
+  family = gaussian(link = "identity"),  
+  prior_intercept = prior_intercept,
+  prior = prior_slopes,
+  chains = 4,
+  iter = 4000,
+  warmup = 2000,
+  cores = parallel::detectCores(),
+  seed = current_seed,
+  adapt_delta = 0.95,
+  refresh = 100
+)
+
+# 💾 Save fitted model to disk for later use
+saveRDS(fit_rt_model, "bis_rt_model_fit_avg_stan_glmer.rds")
+
+print(describe_posterior(fit_rt_model, centrality = "Mean"), digits = 3)
+

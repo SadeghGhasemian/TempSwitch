@@ -1,0 +1,213 @@
+# — keep your libraries & setup as before —
+library(brms)
+library(tidyverse)
+library(cmdstanr)
+library(bayestestR)
+library(posterior)
+
+options(brms.backend = "cmdstanr")
+set.seed(123)
+setwd("E:/TemporalSwitch/DataAnalysis/brms")
+
+# ===================== #
+# 📁 1. Load & Aggregate
+# ===================== #
+df_raw <- read_csv("bis_choice_trials.csv") %>%
+  mutate(
+    response = as.numeric(response == 1),
+    duration = duration,
+    hist = factor(hist),
+    subj = factor(subj)
+  )
+
+df_binom <- df_raw %>%
+  group_by(duration, hist, subj) %>%
+  summarise(
+    successes = sum(response),
+    trials = n(),
+    .groups = "drop"
+  )
+
+write_csv(df_binom, "bis_trials_aggregated_binomial.csv")
+
+# ========== nonlinear formula (unchanged shape) ==========
+nonlinear_formula <- bf(
+  successes | trials(trials) ~ inv_logit((duration - PSE) / sigma),
+  PSE  ~  1 + hist + (1 + hist | subj),
+  sigma ~ 1 + hist + (1 + hist | subj),
+  nl = TRUE
+)
+
+# ========== revised priors tuned to duration range 0.2 - 0.8 ==========
+priors <- c( prior(normal(0, 0.1), class = "b", nlpar = "PSE"),
+prior(exponential(1), class = "sd", nlpar = "PSE"),
+prior(normal(0.1, 0.05), class = "b", nlpar = "sigma", lb = 0.02), 
+prior(exponential(1), class = "sd", nlpar = "sigma") )
+
+# ========== fit model ==========
+fit_brms <- brm(
+  formula = nonlinear_formula,
+  data = df_binom,
+  prior = priors,
+  family = binomial(link = "identity"),   # keep this because the model itself computes inv_logit()
+  backend = "cmdstanr",
+  chains = 4,
+  cores = parallel::detectCores(),
+  threads = threading(2),
+  iter = 6000,
+  warmup = 3000,
+  init = 0.01,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  file = "brms_psychometric_fit_binomial_bis.rds"
+)
+
+################################# psychometric plots #####################################
+
+# ===================== #
+# 📦 Libraries
+# ===================== #
+library(tidyverse)
+library(brms)
+library(Cairo)
+
+setwd("E:/TemporalSwitch/DataAnalysis/brms")
+
+# ===================== #
+# 📁 Load Model & Raw Data
+# ===================== #
+fit_brms <- readRDS("brms_psychometric_fit_binomial_bis.rds")
+
+df_raw <- read_csv("bis_choice_trials.csv") %>%
+  mutate(
+    response = as.numeric(response == 1),
+    duration = duration,
+    hist = factor(hist),
+    subj = factor(subj)
+  )
+
+# ===================== #
+# 📊 Posterior Predictions (Population-Level)
+# ===================== #
+duration_seq <- seq(min(df_raw$duration),
+                    max(df_raw$duration),
+                    length.out = 200)
+
+newdata <- expand_grid(
+  duration = duration_seq,
+  hist = levels(df_raw$hist),
+  subj = levels(df_raw$subj)
+) %>% mutate(trials = 1)
+
+# Matrix: draws x rows
+preds <- posterior_epred(fit_brms, newdata = newdata, re_formula = NULL)
+
+# Reshape into tidy tibble
+preds_df <- as_tibble(t(preds)) %>%
+  bind_cols(newdata) %>%
+  pivot_longer(
+    cols = starts_with("V"),
+    names_to = "draw",
+    values_to = "value"
+  )
+
+# Summarize across posterior draws
+pred_summary <- preds_df %>%
+  group_by(duration, hist) %>%
+  summarise(
+    mean = mean(value),
+    lower = quantile(value, 0.025),
+    upper = quantile(value, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(duration_ms = duration * 1000)
+
+# ===================== #
+# 📈 Empirical Summary (Group-Level)
+# ===================== #
+df_binom <- df_raw %>%
+  group_by(duration, hist, subj) %>%
+  summarise(
+    successes = sum(response),
+    trials = n(),
+    .groups = "drop"
+  )
+
+emp_data <- df_binom %>%
+  group_by(duration, hist) %>%
+  summarise(
+    total_successes = sum(successes),
+    total_trials = sum(trials),
+    prop_response_1 = total_successes / total_trials,
+    .groups = "drop"
+  ) %>%
+  mutate(duration_ms = duration  * 1000)
+
+# ===================== #
+# 🎨 Plot Psychometric Function (Population-Level)
+# ===================== #
+colors <- c("R" = "black", "S" = "gray50")
+
+p <- ggplot(pred_summary, aes(x = duration_ms, y = mean, color = hist)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(
+    data = emp_data,
+    aes(x = duration_ms, y = prop_response_1, color = hist),
+    size = 3
+  ) +
+  scale_color_manual(values = colors) +
+  scale_x_continuous(
+    name = "Duration (ms)",
+    limits = c(200, 800),                  # 👈 set x-axis range manually
+    breaks = seq(200, 800, by = 100),       # 👈 set tick positions
+    labels = scales::number_format(accuracy = 1)
+  ) +
+  labs(
+    title = "Psychometric Function by History Condition (Binomial Model)",
+    y = "Probability of long choice"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "right")
+
+
+print(p)
+
+# ===================== #
+# 💾 Save to PDF
+# ===================== #
+CairoPDF("psychometric_plot_bis_binomial.pdf", width = 8, height = 6)
+print(p)
+dev.off()
+################################################ subject level posteriors ##########################################
+# =========================== #
+# 📦 Load Required Libraries
+# =========================== #
+library(brms)
+library(tidyverse)
+library(bayestestR)
+library(posterior)
+
+# =========================== #
+# 🧠 Load model and data
+# =========================== #
+
+setwd("E:/TemporalSwitch/DataAnalysis/brms")
+
+fit_brms <- readRDS("brms_psychometric_fit_binomial_bis.rds")
+
+model <- as.data.frame(coef(fit_brms))
+
+mean_PSE_hist_diff <- mean(model$subj.Estimate.PSE_histS *1000)
+mean_PSE_hist_diff
+
+hdi_PSE_hist_diff <- c(mean(model$subj.Q2.5.PSE_histS)*1000, mean(model$subj.Q97.5.PSE_histS)*1000)
+hdi_PSE_hist_diff
+
+mean_sigma_hist_diff <- mean(model$subj.Estimate.sigma_histS*1000)
+mean_sigma_hist_diff
+
+hdi_sigma_hist_diff <- c(mean(model$subj.Q2.5.sigma_histS*1000), mean(model$subj.Q97.5.sigma_histS*1000))
+hdi_sigma_hist_diff
+
+
+
+

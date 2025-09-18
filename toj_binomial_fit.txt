@@ -1,0 +1,314 @@
+# ===================== #
+# 🔧 0. Setup
+# ===================== #
+library(brms)
+library(tidyverse)
+library(cmdstanr)
+library(bayestestR)
+library(posterior)
+
+options(brms.backend = "cmdstanr")
+set.seed(123)
+ setwd("E:/TemporalSwitch/DataAnalysis/brms") # Use here::here() for reproducible paths
+
+# ===================== #
+# 📁 1. Load & Aggregate
+# ===================== #
+df_raw <- read_csv("toj_choice_trials.csv") %>%
+  mutate(
+    response = as.numeric(response == 1),
+    soa_sec = soa/1000,
+    hist = factor(hist),
+    subj = factor(subj)
+  )
+
+df_binom <- df_raw %>%
+  group_by(soa_sec, hist, subj) %>%
+  summarise(
+    successes = sum(response),
+    trials = n(),
+    .groups = "drop"
+  )
+
+write_csv(df_binom, "toj_trials_aggregated_binomial.csv")
+
+# ===================== #
+# 🧠 2. Nonlinear Model (Optimized)
+# ===================== #
+# Using the standard probit link simplifies the model and improves stability
+nonlinear_formula_optimized <- bf(
+ successes | trials(trials) ~ (soa_sec - PSS) / sigma,
+  PSS  ~ 1 + hist + (1 + hist | subj),
+  sigma ~ 1 + hist + (1 + hist | subj),
+  nl = TRUE
+)
+
+# ===================== #
+# 🎯 3. Priors (Refined)
+# ===================== #
+priors_refined <- c(
+  prior(normal(0, 0.1), class = "b", nlpar = "PSS"),
+  prior(exponential(1), class = "sd", nlpar = "PSS"),
+  prior(normal(0.1, 0.05), class = "b", nlpar = "sigma", lb = 0.02),
+  prior(exponential(1), class = "sd", nlpar = "sigma")
+)
+
+# ===================== #
+# 🚀 4. Fit Model (Optimized)
+# ===================== #
+fit_brms_optimized <- brm(
+  formula = nonlinear_formula_optimized,
+  data = df_binom,
+  prior = priors_refined,
+  family = binomial(link = "probit"), # Use the standard probit link
+  backend = "cmdstanr",
+  chains = 4,
+  cores = parallel::detectCores(),
+  threads = threading(2),
+  iter = 6000,
+  warmup = 3000,
+  init = 0,
+  control = list(adapt_delta = 0.995, max_treedepth = 15),
+  file = "brms_psychometric_fit_binomial_toj.rds"
+)
+
+################################# psychometric plots #####################################
+
+# ===================== #
+# 📦 Libraries
+# ===================== #
+library(tidyverse)
+library(brms)
+library(Cairo)
+
+# ===================== #
+# 📁 Load Model & Data
+# ===================== #
+
+setwd("E:/TemporalSwitch/DataAnalysis/brms")
+
+fit_brms <- readRDS("brms_psychometric_fit_binomial_toj.rds")
+
+df_raw <- read_csv("toj_choice_trials.csv") %>%
+  mutate(
+    response = as.numeric(response == 1),
+    soa_ms = soa,                                # keep in ms, -100 to 100
+    soa_sec = soa/1000,    # seconds (for model fitting)
+    hist = factor(hist),
+    subj = factor(subj)
+  )
+
+# ===================== #
+# 📊 Posterior Predictions (Include Subj)
+# ===================== #
+soa_seq <- seq(min(df_raw$soa_sec),
+               max(df_raw$soa_sec),
+               length.out = 200)
+
+
+newdata <- expand_grid(
+  soa_sec = soa_seq,
+  hist = levels(df_raw$hist),
+  subj = levels(df_raw$subj)   # include subjects for random effects
+) %>% mutate(trials = 1)
+
+# 1. Get predictions
+preds <- posterior_epred(fit_brms, newdata = newdata, re_formula = NULL)
+
+# 2. Convert to tidy format
+preds_df <- as_tibble(t(preds)) %>%   # transpose: rows = newdata, cols = draws
+  bind_cols(newdata) %>%
+  pivot_longer(
+    cols = starts_with("V"),   # the draws
+    names_to = "draw",
+    values_to = "value"
+  )
+
+# 3. Summarise posterior predictions
+pred_summary <- preds_df %>%
+  group_by(soa_sec, hist) %>%
+  summarise(
+    mean  = mean(value),
+    lower = quantile(value, 0.025),
+    upper = quantile(value, 0.975),
+    .groups = "drop"
+  ) %>%
+  # ✅ proper back-transform to ms
+  mutate(soa_ms = (soa_sec) * 1000)
+
+# ===================== #
+# 📈 Empirical Summary
+# ===================== #
+df_binom <- df_raw %>%
+  group_by(soa_sec, hist, subj) %>%
+  summarise(successes = sum(response), trials = n(), .groups = "drop")
+
+emp_data <- df_binom %>%
+  group_by(soa_sec, hist, subj) %>%
+  summarise(
+    total_successes = sum(successes),
+    total_trials = sum(trials),
+    prop_response_1 = total_successes / total_trials,
+    .groups = "drop"
+  ) %>%
+  mutate(soa_ms = (soa_sec) * 1000)
+
+# ===================== #
+# 🎨 Plotting Options
+# ===================== #
+colors <- c("R" = "black", "S" = "gray50")
+
+# --- (A) Population-level averages (collapsing across subjects)
+pop_summary <- pred_summary %>%
+  group_by(soa_ms, hist) %>%
+  summarise(
+    mean = mean(mean),
+    lower = mean(lower),
+    upper = mean(upper),
+    .groups = "drop"
+  )
+
+p_pop <- ggplot(pop_summary, aes(x = soa_ms, y = mean, color = hist, fill = hist)) +
+  geom_line(linewidth = 1.3) +
+  geom_point(
+    data = emp_data %>% group_by(soa_ms, hist) %>%
+      summarise(prop_response_1 = mean(prop_response_1), .groups = "drop"),
+    aes(x = soa_ms, y = prop_response_1, color = hist),
+    size = 2.5, alpha = 0.8
+  ) +
+  scale_color_manual(values = colors) +
+  scale_fill_manual(values = colors) +
+  scale_x_continuous("SOA (ms)", breaks = c(-100, -72, -44, -16, 16, 44, 72, 100), limits = c(-100, 100)) +
+  scale_y_continuous("Probability of right choice", limits = c(0,1)) +
+  labs(title = "Psychometric Function (Population-Level)") +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "right")
+
+# ===================== #
+# 💾 Save Plots
+# ===================== #
+CairoPDF("psychometric_plot_toj_binomial.pdf", width = 8, height = 6)
+print(p_pop)
+dev.off()
+
+###################### extract posteriors #####################################################
+# =========================== #
+# 📦 Load Required Libraries
+# =========================== #
+library(brms)
+library(tidyverse)
+library(bayestestR)
+library(posterior)
+
+# =========================== #
+# 🧠 Load model and data
+# =========================== #
+
+setwd("E:/TemporalSwitch/DataAnalysis/brms")
+
+fit_brms <- readRDS("brms_psychometric_fit_binomial_toj.rds")
+
+# Load raw data and store original SOA mean before centering
+df_raw <- read_csv("toj_choice_trials.csv") %>%
+  mutate(
+    response = as.numeric(response == 1),
+    soa_sec = soa / 1000  # convert ms to sec
+  )
+
+soa_mean_sec <- mean(df_raw$soa_sec)      # mean in seconds
+soa_mean_ms  <- soa_mean_sec * 1000       # mean in ms
+
+# Create centered version for any later use
+df <- df_raw %>%
+  mutate(
+    soa = soa_sec - soa_mean_sec,  # mean-centered
+    hist = factor(hist),
+    subj = factor(subj)
+  )
+
+# =========================== #
+# 🔍 Extract Posterior Draws
+# =========================== #
+draws <- as_draws_df(fit_brms)
+
+# =========================== #
+# 🧮 Compute Condition-wise Estimates
+# =========================== #
+# PSS in centered seconds
+draws$PSS_R <- draws$b_PSS_Intercept
+draws$PSS_S <- draws$b_PSS_Intercept + draws$`b_PSS_histS`
+
+# sigma (spread) in seconds
+draws$sigma_R <- draws$b_sigma_Intercept
+draws$sigma_S <- draws$b_sigma_Intercept + draws$`b_sigma_histS`
+
+# =========================== #
+# 🔁 Back-transform to milliseconds
+# =========================== #
+# PSS back to absolute ms scale
+draws$PSS_R_ms <- (draws$PSS_R + soa_mean_sec) * 1000
+draws$PSS_S_ms <- (draws$PSS_S + soa_mean_sec) * 1000
+
+# JND = sigma * 0.674, also in ms
+draws$JND_R_ms <- draws$sigma_R * 0.674 * 1000
+draws$JND_S_ms <- draws$sigma_S * 0.674 * 1000
+
+# =========================== #
+# ➕ Differences between conditions
+# =========================== #
+draws$diff_PSS_ms <- draws$PSS_S_ms - draws$PSS_R_ms
+draws$diff_JND_ms <- draws$JND_S_ms - draws$JND_R_ms
+
+posterior_df <- draws %>%
+  select(PSS_R_ms, PSS_S_ms, JND_R_ms, JND_S_ms,
+         diff_PSS_ms, diff_JND_ms)
+
+write_csv(posterior_df, "posterior_toj.csv")
+
+ss <- describe_posterior(fit_brms)
+print(ss, digits = 6)
+
+rep <- abs(posterior_df$PSS_R_ms)
+swit <- abs(posterior_df$PSS_S_ms)
+
+diff <- swit-rep
+
+diff_describe <- print(describe_posterior(diff), digits = 4)
+
+rep <- posterior_df$JND_R_ms
+swit <- posterior_df$JND_S_ms
+
+diff <- swit-rep
+
+diff_describe <- print(describe_posterior(diff), digits = 4)
+
+################################################ subject level posteriors ##########################################
+# =========================== #
+# 📦 Load Required Libraries
+# =========================== #
+library(brms)
+library(tidyverse)
+library(bayestestR)
+library(posterior)
+
+# =========================== #
+# 🧠 Load model and data
+# =========================== #
+
+setwd("E:/TemporalSwitch/DataAnalysis/brms")
+
+fit_brms <- readRDS("brms_psychometric_fit_binomial_toj.rds")
+
+model <- as.data.frame(coef(fit_brms))
+
+mean_PSS_hist_diff <- mean(model$subj.Estimate.PSS_histS *1000)
+mean_PSS_hist_diff
+
+hdi_PSS_hist_diff <- c(mean(model$subj.Q2.5.PSS_histS)*1000, mean(model$subj.Q97.5.PSS_histS)*1000)
+hdi_PSS_hist_diff
+
+mean_sigma_hist_diff <- mean(model$subj.Estimate.sigma_histS*1000)
+mean_sigma_hist_diff
+
+hdi_sigma_hist_diff <- c(mean(model$subj.Q2.5.sigma_histS*1000), mean(model$subj.Q97.5.sigma_histS*1000))
+hdi_sigma_hist_diff
